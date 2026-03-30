@@ -8,8 +8,14 @@ const CONFIG = {
     REGISTER_TIME_WINDOW: 5 * 60 * 1000, // 5分钟
 };
 
-// 由于 GitHub Pages 是静态托管，需要用 JSON 文件模拟后端
-// 实际部署时需要后端服务或使用 localStorage + GitHub API 存储
+// GitHub 配置
+const GITHUB_CONFIG = {
+    owner: 'MrDragonForest',
+    repo: 'MarriedCameraShare',
+    branch: 'main',
+    token: '' // 将在登录时设置
+};
+
 const DATA_PATH = {
     users: 'data/users.json',
     posts: 'data/posts.json',
@@ -36,40 +42,158 @@ let state = {
 
 // ====== 初始化 ======
 document.addEventListener('DOMContentLoaded', async () => {
+    // 检查是否已有 GitHub token
+    const savedToken = localStorage.getItem('mcs_github_token');
+    if (savedToken) {
+        GITHUB_CONFIG.token = savedToken;
+    }
+    
     await loadData();
     checkLoginStatus();
     initEventListeners();
     generateCaptcha();
 });
 
+// ====== GitHub API =====
+async function githubUploadImage(file) {
+    const today = new Date().toISOString().split('T')[0];
+    const ext = file.name.split('.').pop() || 'jpg';
+    const randomName = Math.random().toString(36).substring(2, 10);
+    const filename = `${today}/${randomName}.${ext}`;
+    
+    // 读取文件为 base64
+    const reader = new FileReader();
+    const base64 = await new Promise((resolve) => {
+        reader.onload = () => {
+            // 移除 data:image/xxx;base64, 前缀
+            const result = reader.result.split(',')[1];
+            resolve(result);
+        };
+        reader.readAsDataURL(file);
+    });
+    
+    const url = `https://api.github.com/repos/${GITHUB_CONFIG.owner}/${GITHUB_CONFIG.repo}/contents/${DATA_PATH.images}${filename}`;
+    
+    const data = {
+        message: `upload: ${filename}`,
+        content: base,
+        branch: GITHUB_CONFIG.branch
+    };
+    
+    const response = await fetch(url, {
+        method: 'PUT',
+        headers: {
+            'Authorization': `token ${GITHUB_CONFIG.token}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(data)
+    });
+    
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || 'Upload failed');
+    }
+    
+    const result = await response.json();
+    return {
+        filename: filename,
+        sha: result.content.sha,
+        path: result.content.path
+    };
+}
+
+async function githubUpdatePosts(posts) {
+    // 先获取当前的 posts.json
+    const url = `https://api.github.com/repos/${GITHUB_CONFIG.owner}/${GITHUB_CONFIG.repo}/contents/${DATA_PATH.posts}`;
+    
+    // 获取现有文件的 sha
+    const getResp = await fetch(url, {
+        headers: {
+            'Authorization': `token ${GITHUB_CONFIG.token}`,
+            'Accept': 'application/vnd.github.v3+json'
+        }
+    });
+    
+    const existing = await getResp.json();
+    const sha = existing.sha;
+    
+    // 更新文件
+    const content = btoa(JSON.stringify({ posts }, null, 2));
+    
+    const updateResp = await fetch(url, {
+        method: 'PUT',
+        headers: {
+            'Authorization': `token ${GITHUB_CONFIG.token}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            message: 'update: posts.json',
+            content: content,
+            sha: sha,
+            branch: GITHUB_CONFIG.branch
+        })
+    });
+    
+    if (!updateResp.ok) {
+        const error = await updateResp.json();
+        throw new Error(error.message || 'Update failed');
+    }
+    
+    return await updateResp.json();
+}
+
 // ====== 数据加载 ======
 async function loadData() {
-    try {
-        // 尝试从 localStorage 加载（开发环境）
+    if (!GITHUB_CONFIG.token) {
+        // 没有 token，只用 localStorage
         const savedUsers = localStorage.getItem('mcs_users');
         const savedPosts = localStorage.getItem('mcs_posts');
         
         if (savedUsers) {
             state.users = JSON.parse(savedUsers);
         } else {
-            // 默认用户数据
             state.users = {
                 users: [
                     { username: 'admin', password: hashCode('123456'), nickname: '管理员', createdAt: new Date().toISOString() }
                 ],
                 registerLogs: []
             };
-            saveUsers();
         }
         
         if (savedPosts) {
             state.posts = JSON.parse(savedPosts);
         } else {
             state.posts = { posts: [] };
-            savePosts();
+        }
+        return;
+    }
+    
+    try {
+        // 从 GitHub 加载数据
+        const postsResp = await fetch(`https://raw.githubusercontent.com/${GITHUB_CONFIG.owner}/${GITHUB_CONFIG.repo}/${GITHUB_CONFIG.branch}/${DATA_PATH.posts}`);
+        if (postsResp.ok) {
+            state.posts = await postsResp.json();
+        } else {
+            state.posts = { posts: [] };
+        }
+        
+        // 用户数据还是用 localStorage（注册需要频繁更新）
+        const savedUsers = localStorage.getItem('mcs_users');
+        if (savedUsers) {
+            state.users = JSON.parse(savedUsers);
+        } else {
+            state.users = {
+                users: [
+                    { username: 'admin', password: hashCode('123456'), nickname: '管理员', createdAt: new Date().toISOString() }
+                ],
+                registerLogs: []
+            };
         }
     } catch (e) {
         console.error('加载数据失败:', e);
+        state.posts = { posts: [] };
     }
 }
 
@@ -78,7 +202,18 @@ function saveUsers() {
 }
 
 function savePosts() {
-    localStorage.setItem('mcs_posts', JSON.stringify(state.posts));
+    if (GITHUB_CONFIG.token) {
+        // 保存到 GitHub
+        githubUpdatePosts(state.posts.posts).then(() => {
+            console.log('Posts saved to GitHub');
+        }).catch(e => {
+            console.error('Save to GitHub failed:', e);
+            // 降级到 localStorage
+            localStorage.setItem('mcs_posts', JSON.stringify(state.posts));
+        });
+    } else {
+        localStorage.setItem('mcs_posts', JSON.stringify(state.posts));
+    }
 }
 
 // ====== 密码哈希 ======
@@ -108,9 +243,7 @@ function updateUIForLoggedIn() {
     document.getElementById('filterBar').style.display = 'flex';
     document.getElementById('welcomeText').textContent = `👤 ${state.currentUser.nickname || state.currentUser.username}`;
     
-    // 加载图片列表
     loadPhotoList();
-    // 加载用户筛选选项
     loadUserFilterOptions();
 }
 
@@ -125,10 +258,8 @@ function updateUIForLoggedOut() {
 
 // ====== 事件监听 ======
 function initEventListeners() {
-    // 登录/注册弹窗
     document.getElementById('loginBtn').addEventListener('click', () => showModal('authModal'));
     
-    // 关闭弹窗
     document.querySelectorAll('.modal-close, [data-close]').forEach(btn => {
         btn.addEventListener('click', (e) => {
             const modalId = e.target.dataset.close;
@@ -136,52 +267,40 @@ function initEventListeners() {
         });
     });
     
-    // 点击遮罩关闭
     document.querySelectorAll('.modal').forEach(modal => {
         modal.addEventListener('click', (e) => {
             if (e.target === modal) hideModal(modal.id);
         });
     });
     
-    // 登录/注册切换
     document.getElementById('authSwitch').addEventListener('click', (e) => {
         e.preventDefault();
         toggleAuthMode();
     });
     
-    // 登录/注册表单提交
     document.getElementById('authForm').addEventListener('submit', handleAuthSubmit);
     
-    // 验证码点击刷新
     document.getElementById('captchaImg').addEventListener('click', generateCaptcha);
     
-    // 退出登录
     document.getElementById('logoutBtn').addEventListener('click', handleLogout);
     
-    // 上传按钮
     document.getElementById('uploadBtn').addEventListener('click', () => showModal('uploadModal'));
     
-    // 上传区域点击
     document.getElementById('uploadArea').addEventListener('click', () => {
         document.getElementById('fileInput').click();
     });
     
-    // 文件选择
     document.getElementById('fileInput').addEventListener('change', handleFileSelect);
     
-    // 拖拽上传
     document.getElementById('uploadArea').addEventListener('dragover', (e) => {
         e.preventDefault();
-        e.stopPropagation();
     });
     
     document.getElementById('uploadArea').addEventListener('drop', (e) => {
         e.preventDefault();
-        e.stopPropagation();
         handleFiles(e.dataTransfer.files);
     });
     
-    // 添加标签
     document.getElementById('addTagBtn').addEventListener('click', addTag);
     document.getElementById('tagInput').addEventListener('keypress', (e) => {
         if (e.key === 'Enter') {
@@ -190,10 +309,8 @@ function initEventListeners() {
         }
     });
     
-    // 确认上传
     document.getElementById('confirmUploadBtn').addEventListener('click', handleUpload);
     
-    // 筛选
     document.getElementById('filterBtn').addEventListener('click', applyFilters);
     document.getElementById('resetFilterBtn').addEventListener('click', resetFilters);
 }
@@ -217,22 +334,18 @@ function generateCaptcha() {
     state.captcha = captcha;
     state.captchaExpire = Date.now() + CONFIG.CAPTCHA_EXPIRE;
     
-    // 生成简单的验证码图片（使用 Canvas）
     const canvas = document.createElement('canvas');
     canvas.width = 100;
     canvas.height = 38;
     const ctx = canvas.getContext('2d');
     
-    // 背景
     ctx.fillStyle = '#f0f0f0';
     ctx.fillRect(0, 0, 100, 38);
     
-    // 文字
     ctx.fillStyle = '#333';
     ctx.font = '24px Arial';
     ctx.fillText(captcha, 20, 28);
     
-    // 干扰线
     ctx.strokeStyle = '#ccc';
     for (let i = 0; i < 3; i++) {
         ctx.beginPath();
@@ -272,20 +385,25 @@ async function handleAuthSubmit(e) {
     const password = document.getElementById('password').value;
     const captcha = document.getElementById('captcha').value.trim();
     
+    // 如果填写了 GitHub token，保存
+    const githubToken = document.getElementById('githubToken')?.value.trim();
+    if (githubToken) {
+        GITHUB_CONFIG.token = githubToken;
+        localStorage.setItem('mcs_github_token', githubToken);
+    }
+    
     if (!username || !password) {
-        alert('请填写完整信息');
+        alert('请填写用户名和密码');
         return;
     }
     
     if (isRegisterMode) {
-        // 注册
         if (!validateCaptcha(captcha)) {
             alert('验证码错误');
             generateCaptcha();
             return;
         }
         
-        // 检查频繁注册
         const now = Date.now();
         const recentLogs = state.users.registerLogs.filter(log => 
             now - new Date(log.time).getTime() < CONFIG.REGISTER_TIME_WINDOW
@@ -296,13 +414,11 @@ async function handleAuthSubmit(e) {
             return;
         }
         
-        // 检查用户名是否存在
         if (state.users.users.some(u => u.username === username)) {
             alert('用户名已存在');
             return;
         }
         
-        // 创建新用户
         const newUser = {
             username,
             password: hashCode(password),
@@ -318,7 +434,6 @@ async function handleAuthSubmit(e) {
         
         saveUsers();
         
-        // 自动登录
         state.currentUser = newUser;
         localStorage.setItem('mcs_currentUser', JSON.stringify(newUser));
         
@@ -327,7 +442,6 @@ async function handleAuthSubmit(e) {
         updateUIForLoggedIn();
         
     } else {
-        // 登录
         const user = state.users.users.find(u => 
             u.username === username && u.password === hashCode(password)
         );
@@ -342,9 +456,14 @@ async function handleAuthSubmit(e) {
         
         hideModal('authModal');
         updateUIForLoggedIn();
+        
+        // 重新加载数据（如果有 GitHub token）
+        if (GITHUB_CONFIG.token) {
+            await loadData();
+            loadPhotoList();
+        }
     }
     
-    // 重置表单
     document.getElementById('username').value = '';
     document.getElementById('password').value = '';
     document.getElementById('captcha').value = '';
@@ -393,7 +512,7 @@ function getFilteredPosts() {
     return state.posts.posts.filter(post => {
         if (state.filters.username && post.username !== state.filters.username) return false;
         if (state.filters.date && post.date !== state.filters.date) return false;
-        if (state.filters.tag && !post.tags.some(t => t.includes(state.filters.tag))) return false;
+        if (state.filters.tag && !post.tags?.some(t => t.includes(state.filters.tag))) return false;
         return true;
     });
 }
@@ -403,7 +522,6 @@ function loadPhotoList() {
     const filtered = getFilteredPosts();
     state.filteredPosts = filtered;
     
-    // 按日期分组
     const grouped = {};
     filtered.forEach(post => {
         if (!grouped[post.date]) {
@@ -412,37 +530,11 @@ function loadPhotoList() {
         grouped[post.date].push(post);
     });
     
-    // 排序日期（从新到旧）
     const sortedDates = Object.keys(grouped).sort((a, b) => new Date(b) - new Date(a));
     
-    // 分页（每页20条，按天计算）
-    const itemsPerPage = CONFIG.ITEMS_PER_PAGE;
-    let currentItems = 0;
-    let currentPage = 1;
-    const paginatedGroups = {};
-    
-    for (const date of sortedDates) {
-        if (currentItems + grouped[date].length > currentPage * itemsPerPage) {
-            if (currentItems < currentPage * itemsPerPage) {
-                // 当天照片跨页
-                const remaining = currentPage * itemsPerPage - currentItems;
-                paginatedGroups[date] = grouped[date].slice(0, remaining);
-                currentItems += grouped[date].length;
-            } else {
-                currentPage++;
-                paginatedGroups[date] = grouped[date].slice(0, itemsPerPage);
-                currentItems += grouped[date].length;
-            }
-        } else {
-            paginatedGroups[date] = grouped[date];
-            currentItems += grouped[date].length;
-        }
-    }
-    
-    // 渲染
     const container = document.getElementById('photoList');
     
-    if (Object.keys(paginatedGroups).length === 0) {
+    if (sortedDates.length === 0) {
         container.innerHTML = `
             <div class="empty-state">
                 <div class="empty-state-icon">📷</div>
@@ -454,7 +546,7 @@ function loadPhotoList() {
     }
     
     let html = '';
-    for (const [date, posts] of Object.entries(paginatedGroups)) {
+    for (const [date, posts] of Object.entries(grouped)) {
         const dateObj = new Date(date);
         const formattedDate = `${dateObj.getFullYear()}年${dateObj.getMonth() + 1}月${dateObj.getDate()}日`;
         
@@ -466,9 +558,13 @@ function loadPhotoList() {
         
         posts.forEach(post => {
             const tagsHtml = post.tags?.map(t => `<span class="photo-tag">${t}</span>`).join('') || '';
+            const imgUrl = GITHUB_CONFIG.token 
+                ? `https://raw.githubusercontent.com/${GITHUB_CONFIG.owner}/${GITHUB_CONFIG.repo}/${GITHUB_CONFIG.branch}/${DATA_PATH.images}${post.filename}`
+                : post.data;
+            
             html += `
                 <div class="photo-card" onclick="showImagePreview('${post.filename}', '${post.nickname}', '${post.date}', '${post.tags?.join(', ') || ''}')">
-                    <img src="${DATA_PATH.images}${post.filename}" alt="照片" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22100%22 height=%22160%22><rect fill=%22%23eee%22 width=%22100%22 height=%22160%22/><text fill=%22%23999%22 x=%2250%%22 y=%2250%%22 text-anchor=%22middle%22>图片加载失败</text></svg>'">
+                    <img src="${imgUrl}" alt="照片" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22100%22 height=%22160%22><rect fill=%22%23eee%22 width=%22100%22 height=%22160%22/><text fill=%22%23999%22 x=%2250%%22 y=%2250%%22 text-anchor=%22middle%22>图片加载失败</text></svg>'">
                     <div class="photo-card-info">
                         <div class="photo-card-user">👤 ${post.nickname || post.username}</div>
                         <div class="photo-card-tags">${tagsHtml}</div>
@@ -484,8 +580,6 @@ function loadPhotoList() {
     }
     
     container.innerHTML = html;
-    
-    // 渲染分页
     renderPagination(filtered.length);
 }
 
@@ -499,11 +593,8 @@ function renderPagination(totalItems) {
     }
     
     let html = '';
-    
-    // 上一页
     html += `<button class="pagination-btn" onclick="goToPage(${state.currentPage - 1})" ${state.currentPage === 1 ? 'disabled' : ''}>‹</button>`;
     
-    // 页码
     for (let i = 1; i <= totalPages; i++) {
         if (i === 1 || i === totalPages || (i >= state.currentPage - 1 && i <= state.currentPage + 1)) {
             html += `<button class="pagination-btn ${i === state.currentPage ? 'active' : ''}" onclick="goToPage(${i})">${i}</button>`;
@@ -512,7 +603,6 @@ function renderPagination(totalItems) {
         }
     }
     
-    // 下一页
     html += `<button class="pagination-btn" onclick="goToPage(${state.currentPage + 1})" ${state.currentPage === totalPages ? 'disabled' : ''}>›</button>`;
     
     container.innerHTML = html;
@@ -623,45 +713,39 @@ async function handleUpload() {
         return;
     }
     
+    if (!GITHUB_CONFIG.token) {
+        alert('请先在登录页面填写 GitHub Token 才能上传图片到仓库');
+        return;
+    }
+    
     const btn = document.getElementById('confirmUploadBtn');
     btn.disabled = true;
     btn.textContent = '上传中...';
     
     try {
         for (const file of state.selectedFiles) {
-            // 生成文件名
-            const ext = file.name.split('.').pop();
-            const randomName = Math.random().toString(36).substring(2, 10);
+            // 上传到 GitHub
+            const result = await githubUploadImage(file);
+            
             const today = new Date().toISOString().split('T')[0];
-            const filename = `${today}/${randomName}.${ext}`;
             
-            // 转换为 Base64 存储（实际项目应该用后端存储）
-            const reader = new FileReader();
-            const base64 = await new Promise((resolve) => {
-                reader.onload = () => resolve(reader.result);
-                reader.readAsDataURL(file);
-            });
-            
-            // 存储到 posts
             const post = {
                 id: Date.now().toString(36) + Math.random().toString(36).substr(2),
                 username: state.currentUser.username,
                 nickname: state.currentUser.nickname || state.currentUser.username,
                 date: today,
-                filename: filename,
+                filename: result.filename,
                 tags: [...state.selectedTags],
-                uploadTime: new Date().toISOString(),
-                data: base64 // 实际项目应存储到服务器
+                uploadTime: new Date().toISOString()
             };
             
             state.posts.posts.unshift(post);
         }
         
-        savePosts();
+        await savePosts();
         
         alert('上传成功！');
         
-        // 关闭弹窗并重置
         hideModal('uploadModal');
         state.selectedFiles = [];
         state.selectedTags = [];
@@ -669,13 +753,12 @@ async function handleUpload() {
         document.getElementById('tagInput').value = '';
         document.getElementById('selectedTags').innerHTML = '';
         
-        // 刷新列表
         loadPhotoList();
         loadUserFilterOptions();
         
     } catch (e) {
         console.error('上传失败:', e);
-        alert('上传失败，请重试');
+        alert('上传失败: ' + e.message);
     }
     
     btn.disabled = false;
@@ -684,11 +767,11 @@ async function handleUpload() {
 
 // ====== 图片预览 ======
 function showImagePreview(filename, nickname, date, tags) {
-    // 先尝试从 posts 中找到原始 base64 数据
-    const post = state.posts.posts.find(p => p.filename === filename);
-    const src = post?.data || `${DATA_PATH.images}${filename}`;
+    const imgUrl = GITHUB_CONFIG.token 
+        ? `https://raw.githubusercontent.com/${GITHUB_CONFIG.owner}/${GITHUB_CONFIG.repo}/${GITHUB_CONFIG.branch}/${DATA_PATH.images}${filename}`
+        : '';
     
-    document.getElementById('previewImage').src = src;
+    document.getElementById('previewImage').src = imgUrl;
     document.getElementById('previewImage').onerror = function() {
         this.src = 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22200%22><rect fill=%22%23eee%22 width=%22200%22 height=%22200%22/><text fill=%22%23999%22 x=%2250%%22 y=%2250%%22 text-anchor=%22middle%22>图片加载失败</text></svg>';
     };
@@ -701,12 +784,6 @@ function showImagePreview(filename, nickname, date, tags) {
 }
 
 // ====== 工具函数 ======
-function formatDate(dateStr) {
-    const date = new Date(dateStr);
-    return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
-}
-
-// 暴露给全局
 window.goToPage = goToPage;
 window.removeFile = removeFile;
 window.removeTag = removeTag;
